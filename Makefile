@@ -13,7 +13,12 @@ $(TARGET): $(OBJS)
 run: $(TARGET)
 	./$(TARGET)
 
+test: $(TARGET)
+	bash tests/all.sh
+
 clean:
 	rm -f $(TARGET) $(OBJS)
 
-.PHONY: run clean
+.PHONY: run test clean
+
+: msh.h
