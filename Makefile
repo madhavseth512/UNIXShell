@@ -17,3 +17,5 @@ clean:
 	rm -f $(TARGET) $(OBJS)
 
 .PHONY: run clean
+
+: msh.h
