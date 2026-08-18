@@ -117,6 +117,24 @@ static int append_arg(command *c, int *cap, const char *word) {
     return 0;
 }
 
+static int append_redir(command *c, redir ***tail, redir_kind kind,
+                        const char *target) {
+    redir *r = calloc(1, sizeof *r);
+    if (r == NULL) {
+        return -1;
+    }
+    r->kind = kind;
+    r->target = strdup(target);
+    if (r->target == NULL) {
+        free(r);
+        return -1;
+    }
+    **tail = r;
+    *tail = &r->next;
+    (void)c;
+    return 0;
+}
+
 static command *parse_command(parser *ps) {
     command *c = calloc(1, sizeof *c);
     if (c == NULL) {
@@ -125,14 +143,42 @@ static command *parse_command(parser *ps) {
     }
 
     int argcap = 0;
+    redir **rtail = &c->redirs;
     int oom = 0;
 
-    while (peek(ps)->type == TOK_WORD) {
-        if (append_arg(c, &argcap, peek(ps)->text) == -1) {
-            oom = 1;
-            break;
+    for (;;) {
+        token *t = peek(ps);
+
+        if (t->type == TOK_WORD) {
+            if (append_arg(c, &argcap, t->text) == -1) {
+                oom = 1;
+                break;
+            }
+            advance(ps);
+            continue;
         }
-        advance(ps);
+
+        if (t->type == TOK_LESS || t->type == TOK_GREAT ||
+            t->type == TOK_DGREAT) {
+            redir_kind kind = (t->type == TOK_LESS)    ? REDIR_IN
+                              : (t->type == TOK_GREAT) ? REDIR_OUT
+                                                       : REDIR_APPEND;
+            advance(ps);
+            /* A redirection operator must be followed by a filename. */
+            if (peek(ps)->type != TOK_WORD) {
+                syntax_error(peek(ps));
+                command_free(c);
+                return NULL;
+            }
+            if (append_redir(c, &rtail, kind, peek(ps)->text) == -1) {
+                oom = 1;
+                break;
+            }
+            advance(ps);
+            continue;
+        }
+
+        break;
     }
 
     if (oom) {
@@ -141,7 +187,8 @@ static command *parse_command(parser *ps) {
         return NULL;
     }
 
-    if (c->argc == 0) {
+    /* Nothing at all: the caller wrote "| foo", "foo &&", or similar. */
+    if (c->argc == 0 && c->redirs == NULL) {
         syntax_error(peek(ps));
         command_free(c);
         return NULL;

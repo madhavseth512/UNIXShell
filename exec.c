@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,7 +67,56 @@ static void expand_pipeline(pipeline *pl) {
                 fprintf(stderr, "msh: out of memory\n");
             }
         }
+        for (redir *r = c->redirs; r != NULL; r = r->next) {
+            if (expand_word(&r->target) == -1) {
+                fprintf(stderr, "msh: out of memory\n");
+            }
+        }
     }
+}
+
+/* ------------------------------------------------------------------ *
+ * Redirection
+ * ------------------------------------------------------------------ */
+
+/*
+ * Applied after fork and before exec, so the file descriptors the new
+ * program inherits are already the ones the user asked for.
+ */
+static int apply_redirs(redir *r) {
+    for (; r != NULL; r = r->next) {
+        int fd;
+        int target;
+
+        switch (r->kind) {
+        case REDIR_IN:
+            fd = open(r->target, O_RDONLY);
+            target = STDIN_FILENO;
+            break;
+        case REDIR_OUT:
+            fd = open(r->target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            target = STDOUT_FILENO;
+            break;
+        case REDIR_APPEND:
+            fd = open(r->target, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            target = STDOUT_FILENO;
+            break;
+        default:
+            return -1;
+        }
+
+        if (fd == -1) {
+            fprintf(stderr, "msh: %s: %s\n", r->target, strerror(errno));
+            return -1;
+        }
+        if (dup2(fd, target) == -1) {
+            perror("msh: dup2");
+            close(fd);
+            return -1;
+        }
+        close(fd); /* dup2 already installed it at the well-known number */
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -84,6 +134,13 @@ static int status_from_wait(int wstatus) {
 }
 
 static void child_exec(command *c) {
+    if (apply_redirs(c->redirs) == -1) {
+        _exit(1);
+    }
+    if (c->argc == 0) {
+        _exit(0); /* redirections only */
+    }
+
     execvp(c->argv[0], c->argv);
 
     /* Only reachable if exec failed: the image was never replaced. */
@@ -113,16 +170,59 @@ static int run_external(command *c) {
 /*
  * A builtin runs in the shell process itself. chdir() and exit() act on the
  * caller, so a forked child would change its own directory and then die,
- * taking the change with it.
+ * taking the change with it. That means its redirections have to be undone
+ * afterwards, or the shell would keep writing into the file forever.
+ *
+ * Also used for a command that is only redirections: a bare "> file"
+ * creates or truncates it.
  */
+static int run_in_shell(command *c) {
+    int saved_in = -1;
+    int saved_out = -1;
+    int status = 0;
+
+    if (c->redirs != NULL) {
+        saved_in = dup(STDIN_FILENO);
+        saved_out = dup(STDOUT_FILENO);
+        if (saved_in == -1 || saved_out == -1) {
+            perror("msh: dup");
+            if (saved_in != -1) {
+                close(saved_in);
+            }
+            if (saved_out != -1) {
+                close(saved_out);
+            }
+            return 1;
+        }
+        if (apply_redirs(c->redirs) == -1) {
+            status = 1;
+        }
+    }
+
+    if (status == 0 && c->argc > 0) {
+        status = run_builtin(c);
+    }
+
+    /* Flush before restoring: buffered output still belongs to the redirect. */
+    fflush(stdout);
+
+    if (saved_in != -1) {
+        dup2(saved_in, STDIN_FILENO);
+        close(saved_in);
+    }
+    if (saved_out != -1) {
+        dup2(saved_out, STDOUT_FILENO);
+        close(saved_out);
+    }
+    return status;
+}
+
 static int run_pipeline(pipeline *pl) {
     expand_pipeline(pl);
 
     command *c = pl->cmds[0];
-    if (is_builtin(c->argv[0])) {
-        int status = run_builtin(c);
-        fflush(stdout);
-        return status;
+    if (c->argc == 0 || is_builtin(c->argv[0])) {
+        return run_in_shell(c);
     }
     return run_external(c);
 }
