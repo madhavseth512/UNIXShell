@@ -196,10 +196,6 @@ static command *parse_command(parser *ps) {
     return c;
 }
 
-/*
- * Milestone 5 turns this into a loop over '|'. For now a pipeline is
- * exactly one command.
- */
 static pipeline *parse_pipeline(parser *ps) {
     pipeline *pl = calloc(1, sizeof *pl);
     if (pl == NULL) {
@@ -207,20 +203,33 @@ static pipeline *parse_pipeline(parser *ps) {
         return NULL;
     }
 
-    command *c = parse_command(ps);
-    if (c == NULL) {
-        pipeline_free(pl);
-        return NULL;
-    }
+    int cap = 0;
+    for (;;) {
+        command *c = parse_command(ps);
+        if (c == NULL) {
+            pipeline_free(pl);
+            return NULL;
+        }
 
-    pl->cmds = malloc(sizeof *pl->cmds);
-    if (pl->cmds == NULL) {
-        fprintf(stderr, "msh: out of memory\n");
-        command_free(c);
-        pipeline_free(pl);
-        return NULL;
+        if (pl->ncmds == cap) {
+            int newcap = cap ? cap * 2 : 4;
+            command **tmp = realloc(pl->cmds, (size_t)newcap * sizeof *tmp);
+            if (tmp == NULL) {
+                fprintf(stderr, "msh: out of memory\n");
+                command_free(c);
+                pipeline_free(pl);
+                return NULL;
+            }
+            pl->cmds = tmp;
+            cap = newcap;
+        }
+        pl->cmds[pl->ncmds++] = c;
+
+        if (peek(ps)->type != TOK_PIPE) {
+            break;
+        }
+        advance(ps);
     }
-    pl->cmds[pl->ncmds++] = c;
     return pl;
 }
 

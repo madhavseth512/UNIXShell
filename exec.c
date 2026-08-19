@@ -80,8 +80,8 @@ static void expand_pipeline(pipeline *pl) {
  * ------------------------------------------------------------------ */
 
 /*
- * Applied after fork and before exec, so the file descriptors the new
- * program inherits are already the ones the user asked for.
+ * Applied after fork and after the pipe wiring, so an explicit redirection
+ * overrides the pipe: in "a | b > f", b's stdout is f, not the pipe.
  */
 static int apply_redirs(redir *r) {
     for (; r != NULL; r = r->next) {
@@ -120,62 +120,13 @@ static int apply_redirs(redir *r) {
 }
 
 /* ------------------------------------------------------------------ *
- * Running one command
+ * Running one command in the shell process
+ *
+ * Used for a lone builtin, and for a command that is only redirections
+ * (a bare "> file" creates or truncates it). Redirections have to be undone
+ * afterwards, or the shell would keep writing into the file forever.
  * ------------------------------------------------------------------ */
 
-static int status_from_wait(int wstatus) {
-    if (WIFEXITED(wstatus)) {
-        return WEXITSTATUS(wstatus);
-    }
-    if (WIFSIGNALED(wstatus)) {
-        return 128 + WTERMSIG(wstatus);
-    }
-    return 1;
-}
-
-static void child_exec(command *c) {
-    if (apply_redirs(c->redirs) == -1) {
-        _exit(1);
-    }
-    if (c->argc == 0) {
-        _exit(0); /* redirections only */
-    }
-
-    execvp(c->argv[0], c->argv);
-
-    /* Only reachable if exec failed: the image was never replaced. */
-    fprintf(stderr, "msh: %s: %s\n", c->argv[0], strerror(errno));
-    _exit(errno == ENOENT ? 127 : 126);
-}
-
-static int run_external(command *c) {
-    pid_t pid = fork();
-
-    if (pid == -1) {
-        perror("msh: fork");
-        return 1;
-    }
-    if (pid == 0) {
-        child_exec(c);
-    }
-
-    int wstatus;
-    if (waitpid(pid, &wstatus, 0) == -1) {
-        perror("msh: waitpid");
-        return 1;
-    }
-    return status_from_wait(wstatus);
-}
-
-/*
- * A builtin runs in the shell process itself. chdir() and exit() act on the
- * caller, so a forked child would change its own directory and then die,
- * taking the change with it. That means its redirections have to be undone
- * afterwards, or the shell would keep writing into the file forever.
- *
- * Also used for a command that is only redirections: a bare "> file"
- * creates or truncates it.
- */
 static int run_in_shell(command *c) {
     int saved_in = -1;
     int saved_out = -1;
@@ -217,14 +168,130 @@ static int run_in_shell(command *c) {
     return status;
 }
 
+/* ------------------------------------------------------------------ *
+ * Pipelines
+ * ------------------------------------------------------------------ */
+
+static int status_from_wait(int wstatus) {
+    if (WIFEXITED(wstatus)) {
+        return WEXITSTATUS(wstatus);
+    }
+    if (WIFSIGNALED(wstatus)) {
+        return 128 + WTERMSIG(wstatus);
+    }
+    return 1;
+}
+
+static void child_exec(command *c) {
+    if (apply_redirs(c->redirs) == -1) {
+        _exit(1);
+    }
+    if (c->argc == 0) {
+        _exit(0); /* redirections only */
+    }
+    /* A builtin inside a pipeline runs in the child, where cd and exit
+       affect only that short-lived process. That is what sh does too. */
+    if (is_builtin(c->argv[0])) {
+        int rc = run_builtin(c);
+        fflush(stdout);
+        _exit(rc);
+    }
+
+    execvp(c->argv[0], c->argv);
+
+    /* Only reachable if exec failed: the image was never replaced. */
+    fprintf(stderr, "msh: %s: %s\n", c->argv[0], strerror(errno));
+    _exit(errno == ENOENT ? 127 : 126);
+}
+
 static int run_pipeline(pipeline *pl) {
     expand_pipeline(pl);
 
-    command *c = pl->cmds[0];
-    if (c->argc == 0 || is_builtin(c->argv[0])) {
-        return run_in_shell(c);
+    if (pl->ncmds == 1) {
+        command *c = pl->cmds[0];
+        if (c->argc == 0 || is_builtin(c->argv[0])) {
+            return run_in_shell(c);
+        }
     }
-    return run_external(c);
+
+    pid_t *pids = malloc((size_t)pl->ncmds * sizeof *pids);
+    if (pids == NULL) {
+        fprintf(stderr, "msh: out of memory\n");
+        return 1;
+    }
+
+    int prev_read = -1; /* read end of the pipe feeding this stage */
+    int started = 0;
+    int failed = 0;
+
+    for (int i = 0; i < pl->ncmds; i++) {
+        int fd[2] = {-1, -1};
+
+        if (i < pl->ncmds - 1 && pipe(fd) == -1) {
+            perror("msh: pipe");
+            failed = 1;
+            break;
+        }
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            perror("msh: fork");
+            if (fd[0] != -1) {
+                close(fd[0]);
+                close(fd[1]);
+            }
+            failed = 1;
+            break;
+        }
+
+        if (pid == 0) {
+            if (prev_read != -1) {
+                dup2(prev_read, STDIN_FILENO);
+                close(prev_read);
+            }
+            if (fd[1] != -1) {
+                close(fd[0]); /* this child never reads its own pipe */
+                dup2(fd[1], STDOUT_FILENO);
+                close(fd[1]);
+            }
+            child_exec(pl->cmds[i]);
+        }
+
+        if (prev_read != -1) {
+            close(prev_read);
+        }
+        if (fd[1] != -1) {
+            /* The shell must close every pipe end it does not need, or the
+               reader never sees EOF and the pipeline hangs forever. */
+            close(fd[1]);
+            prev_read = fd[0];
+        }
+        pids[started++] = pid;
+    }
+
+    if (prev_read != -1) {
+        close(prev_read);
+    }
+
+    if (started == 0) {
+        free(pids);
+        return 1;
+    }
+
+    int status = 1;
+    for (int i = 0; i < started; i++) {
+        int wstatus;
+        if (waitpid(pids[i], &wstatus, 0) == -1) {
+            perror("msh: waitpid");
+            continue;
+        }
+        if (i == started - 1) {
+            status = status_from_wait(wstatus);
+        }
+    }
+
+    free(pids);
+    return failed && started == 0 ? 1 : status;
 }
 
 int run_cmdlist(cmdlist *cl) {
