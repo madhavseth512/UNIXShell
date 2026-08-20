@@ -233,24 +233,40 @@ static pipeline *parse_pipeline(parser *ps) {
     return pl;
 }
 
-/*
- * Milestone 6 turns this into a loop over '&&' and '||'.
- */
 static andor *parse_andor(parser *ps) {
-    pipeline *pl = parse_pipeline(ps);
-    if (pl == NULL) {
-        return NULL;
-    }
+    andor *head = NULL;
+    andor **tail = &head;
 
-    andor *node = calloc(1, sizeof *node);
-    if (node == NULL) {
-        fprintf(stderr, "msh: out of memory\n");
-        pipeline_free(pl);
-        return NULL;
+    for (;;) {
+        pipeline *pl = parse_pipeline(ps);
+        if (pl == NULL) {
+            andor_free(head);
+            return NULL;
+        }
+
+        andor *node = calloc(1, sizeof *node);
+        if (node == NULL) {
+            fprintf(stderr, "msh: out of memory\n");
+            pipeline_free(pl);
+            andor_free(head);
+            return NULL;
+        }
+        node->pl = pl;
+        node->op_to_next = OP_NONE;
+        *tail = node;
+        tail = &node->next;
+
+        token_type t = peek(ps)->type;
+        if (t == TOK_AND_IF) {
+            node->op_to_next = OP_AND;
+        } else if (t == TOK_OR_IF) {
+            node->op_to_next = OP_OR;
+        } else {
+            break;
+        }
+        advance(ps);
     }
-    node->pl = pl;
-    node->op_to_next = OP_NONE;
-    return node;
+    return head;
 }
 
 cmdlist *parse(token_list *tl, int *syntax_err) {
@@ -261,23 +277,38 @@ cmdlist *parse(token_list *tl, int *syntax_err) {
         return NULL; /* blank line: not an error */
     }
 
-    andor *ao = parse_andor(&ps);
-    if (ao == NULL) {
-        *syntax_err = 1;
-        return NULL;
+    cmdlist *head = NULL;
+    cmdlist **tail = &head;
+
+    for (;;) {
+        andor *ao = parse_andor(&ps);
+        if (ao == NULL) {
+            *syntax_err = 1;
+            cmdlist_free(head);
+            return NULL;
+        }
+
+        cmdlist *node = calloc(1, sizeof *node);
+        if (node == NULL) {
+            fprintf(stderr, "msh: out of memory\n");
+            *syntax_err = 1;
+            andor_free(ao);
+            cmdlist_free(head);
+            return NULL;
+        }
+        node->ao = ao;
+        *tail = node;
+        tail = &node->next;
+
+        if (peek(&ps)->type != TOK_SEMI) {
+            break;
+        }
+        advance(&ps);
+        if (peek(&ps)->type == TOK_EOF) {
+            break; /* a trailing ';' is allowed */
+        }
     }
 
-    cmdlist *head = calloc(1, sizeof *head);
-    if (head == NULL) {
-        fprintf(stderr, "msh: out of memory\n");
-        *syntax_err = 1;
-        andor_free(ao);
-        return NULL;
-    }
-    head->ao = ao;
-
-    /* Milestone 6 turns this into a loop over ';'. Until then anything
-       left over is an operator this parser cannot yet handle. */
     if (peek(&ps)->type != TOK_EOF) {
         syntax_error(peek(&ps));
         *syntax_err = 1;

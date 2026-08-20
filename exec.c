@@ -294,8 +294,43 @@ static int run_pipeline(pipeline *pl) {
     return failed && started == 0 ? 1 : status;
 }
 
+/* ------------------------------------------------------------------ *
+ * && and ||
+ * ------------------------------------------------------------------ */
+
+static int run_andor(andor *ao) {
+    int status = g_last_status;
+    int run_next = 1;
+
+    for (andor *n = ao; n != NULL; n = n->next) {
+        if (run_next) {
+            status = run_pipeline(n->pl);
+            g_last_status = status;
+            if (g_exit_requested) {
+                return status;
+            }
+        }
+        /* When a stage is skipped, status carries through unchanged, which
+           is what makes "false && a || b" run b. */
+        if (n->op_to_next == OP_AND) {
+            run_next = (status == 0);
+        } else if (n->op_to_next == OP_OR) {
+            run_next = (status != 0);
+        } else {
+            run_next = 1;
+        }
+    }
+    return status;
+}
+
 int run_cmdlist(cmdlist *cl) {
-    int status = run_pipeline(cl->ao->pl);
-    g_last_status = status;
+    int status = g_last_status;
+
+    for (cmdlist *n = cl; n != NULL; n = n->next) {
+        status = run_andor(n->ao);
+        if (g_exit_requested) {
+            break;
+        }
+    }
     return status;
 }
