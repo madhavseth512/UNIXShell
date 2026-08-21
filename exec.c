@@ -5,11 +5,14 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "msh.h"
 
 int g_last_status = 0;
+int g_interactive = 0;
+pid_t g_shell_pgid = 0;
 
 /* ------------------------------------------------------------------ *
  * $? expansion
@@ -220,7 +223,8 @@ static int run_pipeline(pipeline *pl) {
         return 1;
     }
 
-    int prev_read = -1; /* read end of the pipe feeding this stage */
+    int prev_read = -1;  /* read end of the pipe feeding this stage */
+    pid_t pgid = 0;      /* 0 until the first child defines the group */
     int started = 0;
     int failed = 0;
 
@@ -245,6 +249,11 @@ static int run_pipeline(pipeline *pl) {
         }
 
         if (pid == 0) {
+            /* Join the pipeline's process group before doing anything else,
+               so a Ctrl-C aimed at the group cannot miss this process. */
+            setpgid(0, pgid); /* pgid == 0 means "become your own leader" */
+            signals_child_default();
+
             if (prev_read != -1) {
                 dup2(prev_read, STDIN_FILENO);
                 close(prev_read);
@@ -256,6 +265,13 @@ static int run_pipeline(pipeline *pl) {
             }
             child_exec(pl->cmds[i]);
         }
+
+        /* Parent. setpgid is called in both processes on purpose: whichever
+           runs first wins, and neither side has to win a race. */
+        if (pgid == 0) {
+            pgid = pid;
+        }
+        setpgid(pid, pgid);
 
         if (prev_read != -1) {
             close(prev_read);
@@ -278,18 +294,38 @@ static int run_pipeline(pipeline *pl) {
         return 1;
     }
 
+    /* Hand the terminal to the pipeline so Ctrl-C reaches it and not us. */
+    if (g_interactive && pgid != 0) {
+        tcsetpgrp(STDIN_FILENO, pgid);
+    }
+
     int status = 1;
+    int last_wstatus = 0;
     for (int i = 0; i < started; i++) {
         int wstatus;
         if (waitpid(pids[i], &wstatus, 0) == -1) {
+            if (errno == EINTR) {
+                i--; /* a caught signal is not an answer; ask again */
+                continue;
+            }
             perror("msh: waitpid");
             continue;
         }
         if (i == started - 1) {
+            last_wstatus = wstatus;
             status = status_from_wait(wstatus);
         }
     }
 
+    if (g_interactive) {
+        tcsetpgrp(STDIN_FILENO, g_shell_pgid);
+        /* The terminal echoed "^C" with no newline; finish the line. */
+        if (WIFSIGNALED(last_wstatus) && WTERMSIG(last_wstatus) == SIGINT) {
+            fputc('\n', stderr);
+        }
+    }
+
+    g_sigint = 0;
     free(pids);
     return failed && started == 0 ? 1 : status;
 }

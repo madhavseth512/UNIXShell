@@ -1,33 +1,81 @@
 #include <errno.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "msh.h"
+
+static void prompt(void) {
+    if (g_interactive) {
+        printf("msh> ");
+        fflush(stdout);
+    }
+}
+
+/*
+ * Put the shell in its own process group and give that group the terminal.
+ * Without this, every child would share the shell's group and a Ctrl-C would
+ * hit both. Skipped when stdin is not a terminal, where there is no
+ * foreground group to hand around.
+ */
+static void take_terminal(void) {
+    g_shell_pgid = getpid();
+
+    /* A session leader is already its own process-group leader, and setpgid
+       refuses to move one (EPERM). Only relocate the shell if it is not
+       there yet -- otherwise a login shell would report a spurious error. */
+    if (getpgrp() != g_shell_pgid &&
+        setpgid(g_shell_pgid, g_shell_pgid) == -1) {
+        perror("msh: setpgid");
+        g_shell_pgid = getpgrp(); /* carry on with the group we are in */
+    }
+    if (tcsetpgrp(STDIN_FILENO, g_shell_pgid) == -1) {
+        perror("msh: tcsetpgrp");
+        g_interactive = 0;
+    }
+}
 
 int main(void) {
     char *line = NULL;
     size_t cap = 0;
 
-    /* Milestone 7 replaces this with sigaction and process groups. */
-    signal(SIGINT, SIG_IGN);
+    g_interactive = isatty(STDIN_FILENO) && isatty(STDERR_FILENO);
+    signals_init();
+    if (g_interactive) {
+        take_terminal();
+    }
 
     while (!g_exit_requested) {
-        printf("msh> ");
-        fflush(stdout);
+        g_sigint = 0;
+        prompt();
 
+        errno = 0;
         ssize_t nread = getline(&line, &cap, stdin);
 
         if (nread == -1) {
+            /* A caught SIGINT aborts the read. Without SA_RESTART getline
+               returns -1/EINTR, and treating that as EOF would make Ctrl-C
+               close the shell -- the opposite of the intent. */
+            if (g_sigint || errno == EINTR) {
+                clearerr(stdin);
+                g_sigint = 0;
+                if (g_interactive) {
+                    putchar('\n');
+                }
+                g_last_status = 130; /* 128 + SIGINT */
+                continue;
+            }
             if (ferror(stdin)) {
                 perror("msh: getline");
                 g_last_status = 1;
                 break;
             }
             /* EOF. The prompt left the cursor mid-line. */
-            putchar('\n');
+            if (g_interactive) {
+                putchar('\n');
+            }
             break;
         }
 
@@ -60,5 +108,9 @@ int main(void) {
     }
 
     free(line);
+
+    if (g_interactive) {
+        tcsetpgrp(STDIN_FILENO, g_shell_pgid);
+    }
     return g_exit_requested ? g_exit_code : g_last_status;
 }

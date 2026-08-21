@@ -41,11 +41,6 @@ void token_list_free(token_list *tl);
 /* ------------------------------------------------------------------ *
  * AST
  *
- * The whole grammar is declared here up front, because the shape of the
- * tree is what the parser is for. Milestones 4-6 fill in the productions
- * that are currently stubs: this milestone parses a single command, and
- * anything else is reported as a syntax error.
- *
  *   list     := andor ( ';' andor )* [';']
  *   andor    := pipeline ( ('&&' | '||') pipeline )*
  *   pipeline := command ( '|' command )*
@@ -112,5 +107,12 @@ int run_builtin(command *cmd);
 extern int g_last_status;    /* $? */
 extern int g_exit_requested; /* set by the exit builtin */
 extern int g_exit_code;
+extern int g_interactive;    /* stdin and stderr are both a terminal */
+extern pid_t g_shell_pgid;
+
+extern volatile sig_atomic_t g_sigint;
+
+void signals_init(void);
+void signals_child_default(void);
 
 #endif /* MSH_H */
