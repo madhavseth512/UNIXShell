@@ -1,3 +1,6 @@
 msh
 *.o
 .claude/settings.local.json
+
+# Local working notes for Claude Code. Kept on disk, never published.
+CLAUDE.md
